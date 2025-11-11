@@ -1,0 +1,2 @@
+# app/optimizer/tests/__init__.py
+# (intentionally empty)
