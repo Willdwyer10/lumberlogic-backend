@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
-from optimizer.optimizer import optimize_boards
-from database.supabase_client import supabase
+from app.optimizer.optimizer import optimize_boards
+from app.database.supabase_client import supabase
 
 app = Flask(__name__)
 
