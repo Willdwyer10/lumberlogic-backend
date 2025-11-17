@@ -1,8 +1,10 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from app.optimizer.optimizer import optimize_boards
 from app.database.supabase_client import supabase
 
 app = Flask(__name__)
+CORS(app)
 
 # ==========================
 # Optimize endpoint
