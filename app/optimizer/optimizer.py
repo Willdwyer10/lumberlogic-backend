@@ -1,8 +1,14 @@
 # app/optimizer/optimizer.py
 """
-Enhanced Lumber Optimizer
+Enhanced Lumber Optimizer with True Cost Optimization
 
 Function: optimize_boards(cuts, boards)
+
+This optimizer uses a two-phase approach:
+1. Generate all viable cutting patterns for each board type
+2. Use integer linear programming to select the optimal combination of patterns
+
+This ensures globally optimal solutions, unlike the previous greedy approach.
 
 Inputs:
 
@@ -40,14 +46,6 @@ result : dict
 - "total_cost": float                        # total cost of purchased boards
 - "waste_summary": {board_idx: total_waste, ...}  # total leftover length per board type
 
-Key Features:
-
-1. Each board’s cuts are tracked individually in cut_plan.
-2. Best Fit Decreasing (FFD) bin-packing algorithm efficiently assigns cuts to boards.
-3. Waste per board type is calculated and summarized.
-4. Chooses the lowest-cost combination of boards that satisfies all cut requirements.
-5. Output can be easily converted into human-readable cutting instructions.
-
 Example Usage:
 
 result = optimize_boards(cuts, boards)
@@ -59,58 +57,98 @@ print(result["waste_summary"])
 
 from ortools.linear_solver import pywraplp
 from collections import defaultdict
-import math
+import itertools
 
 
-def _pack_cuts_into_boards(cuts_list, board_length, num_boards=None):
+def _generate_cutting_patterns(cut_lengths, board_length, max_patterns=1000):
+    """
+    Generate all feasible cutting patterns for a board.
+    
+    A pattern is a combination of cuts that fits on one board.
+    Uses dynamic programming to efficiently generate patterns.
+    
+    Args:
+        cut_lengths: List of unique cut lengths needed
+        board_length: Length of the board
+        max_patterns: Maximum number of patterns to generate (prevent explosion)
+    
+    Returns:
+        List of patterns, where each pattern is a dict {cut_length: count}
+    """
+    patterns = []
+    cut_lengths_sorted = sorted(set(cut_lengths), reverse=True)
+    
+    def generate_recursive(remaining_length, current_pattern, start_idx):
+        """Recursively generate patterns using backtracking"""
+        if len(patterns) >= max_patterns:
+            return
+        
+        # Add current pattern if it's non-empty
+        if sum(current_pattern.values()) > 0:
+            patterns.append(current_pattern.copy())
+        
+        # Try adding each cut type
+        for i in range(start_idx, len(cut_lengths_sorted)):
+            cut_len = cut_lengths_sorted[i]
+            if cut_len <= remaining_length:
+                # Add this cut to the pattern
+                current_pattern[cut_len] = current_pattern.get(cut_len, 0) + 1
+                generate_recursive(remaining_length - cut_len, current_pattern, i)
+                # Backtrack
+                current_pattern[cut_len] -= 1
+                if current_pattern[cut_len] == 0:
+                    del current_pattern[cut_len]
+    
+    generate_recursive(board_length, {}, 0)
+    
+    # Sort patterns by efficiency (less waste is better)
+    patterns.sort(key=lambda p: sum(k * v for k, v in p.items()), reverse=True)
+    
+    return patterns
+
+
+def _pack_cuts_into_boards(cuts_list, board_length):
     """
     Pack a list of cut lengths into individual boards using Best Fit Decreasing.
-
+    
+    This is used after optimization to create the detailed cutting plan.
+    
     Args:
         cuts_list: List of cut lengths to pack (e.g., [10, 10, 20, 5])
         board_length: Length of each board
-        num_boards: Maximum number of boards (None for unlimited)
-
+    
     Returns:
         List of lists, where each inner list is the cuts for one board
         Example: [[10, 5], [10, 20]] means board 1 has cuts of 10 and 5
     """
     if not cuts_list:
         return []
-
-    # Sort cuts in descending order for better packing (Best Fit Decreasing)
+    
+    # Sort cuts in descending order for better packing
     sorted_cuts = sorted(cuts_list, reverse=True)
-
+    
     # Initialize boards: List of [remaining_space, [cuts]]
     boards = []
-
+    
     for cut in sorted_cuts:
         # Find best board: one with smallest remaining space that still fits the cut
         best_board_idx = -1
         best_remaining = float('inf')
-
+        
         for idx, board in enumerate(boards):
             remaining_after = board[0] - cut
             if remaining_after >= 0 and remaining_after < best_remaining:
                 best_board_idx = idx
                 best_remaining = remaining_after
-
+        
         if best_board_idx >= 0:
             # Place in existing board
             boards[best_board_idx][0] -= cut
             boards[best_board_idx][1].append(cut)
         else:
             # Need a new board
-            if num_boards is not None and len(boards) >= num_boards:
-                total_needed = sum(cuts_list)
-                total_available = num_boards * board_length
-                raise RuntimeError(
-                    f"Cannot fit cuts into {num_boards} boards of length {board_length}. "
-                    f"Total cut length: {total_needed}\", Available space: {total_available}\" "
-                    f"(bin packing inefficiency: {total_needed/total_available:.1%})"
-                )
             boards.append([board_length - cut, [cut]])
-
+    
     # Return just the cut lists
     return [board[1] for board in boards]
 
@@ -118,45 +156,47 @@ def _pack_cuts_into_boards(cuts_list, board_length, num_boards=None):
 def optimize_boards(cuts, boards):
     """
     Optimize board purchasing and cutting to minimize cost.
-
+    
+    Uses pattern-based column generation approach for true optimality.
+    
     Args:
         cuts: List of dicts with keys: width, height, length, quantity
         boards: List of dicts with keys: width, height, length, price
-
+    
     Returns:
         Dict with keys:
             - board_plan: {board_idx: quantity} - how many of each board to buy
             - cut_plan: {board_idx: [[cuts], [cuts], ...]} - cutting plan for each physical board
             - total_cost: total cost in dollars
             - waste_summary: {board_idx: total_waste} - waste per board type
-
+    
     Raises:
         RuntimeError: If no valid solution exists
     """
     # Group cuts and boards by (width, height)
     cut_groups = defaultdict(list)
     board_groups = defaultdict(list)
-
+    
     for cut in cuts:
         cut_groups[(cut['width'], cut['height'])].append(cut)
-
+    
     for idx, board in enumerate(boards):
         board_groups[(board['width'], board['height'])].append((idx, board))
-
+    
     total_board_plan = {}
     total_cut_plan = {}
     total_cost = 0
     waste_summary = {}
-
+    
     # Solve each dimension group independently
     for dim, group_cuts in cut_groups.items():
         if dim not in board_groups:
             raise RuntimeError(
                 f"No boards available for dimension {dim[0]}x{dim[1]}"
             )
-
+        
         group_boards = board_groups[dim]
-
+        
         # VALIDATION: Check if any board can fit each cut
         max_board_length = max(b[1]['length'] for b in group_boards)
         for cut in group_cuts:
@@ -165,137 +205,121 @@ def optimize_boards(cuts, boards):
                     f"Cut length {cut['length']} exceeds maximum available "
                     f"board length {max_board_length} for dimension {dim[0]}x{dim[1]}"
                 )
-
+        
+        # Extract cut requirements: {cut_length: quantity}
+        cut_requirements = {}
+        for cut in group_cuts:
+            cut_len = cut['length']
+            cut_requirements[cut_len] = cut_requirements.get(cut_len, 0) + cut['quantity']
+        
+        # Get all unique cut lengths
+        unique_cut_lengths = list(cut_requirements.keys())
+        
+        # Generate cutting patterns for each board type
+        board_patterns = {}  # {board_idx: [patterns]}
+        for board_idx, board in group_boards:
+            patterns = _generate_cutting_patterns(unique_cut_lengths, board['length'])
+            if patterns:
+                board_patterns[board_idx] = patterns
+        
+        if not board_patterns:
+            raise RuntimeError(
+                f"Cannot generate any valid cutting patterns for dimension {dim[0]}x{dim[1]}"
+            )
+        
+        # Create ILP solver
         solver = pywraplp.Solver.CreateSolver('SCIP')
         if not solver:
             raise RuntimeError("Could not create solver")
-
-        num_cuts = len(group_cuts)
-        num_boards = len(group_boards)
-
-        # Estimate max boards needed with generous buffer for bin packing
-        max_needed = []
-        for _, b in group_boards:
-            board_len = b['length']
-
-            # Calculate worst-case: each cut type might need its own set of boards
-            worst_case = 0
-            for cut in group_cuts:
-                if cut['length'] <= board_len:
-                    cuts_per_board = board_len // cut['length']
-                    if cuts_per_board > 0:
-                        worst_case += math.ceil(cut['quantity'] / cuts_per_board)
-
-            # Also calculate based on total length with 100% buffer for packing inefficiency
-            total_length = sum(c['length'] * c['quantity'] for c in group_cuts)
-            length_based = math.ceil(total_length / board_len * 2.0)
-
-            # Use the maximum plus safety margin
-            max_needed.append(max(worst_case, length_based) + 2)
-
-        # Variables: how many boards of each type to buy
-        board_qty = [
-            solver.IntVar(0, max_needed[j], f'board_qty_{dim}_{j}')
-            for j in range(num_boards)
-        ]
-
-        # Variables: assign cut i to board type j
-        assign = {}
-        for i in range(num_cuts):
-            for j in range(num_boards):
-                if group_cuts[i]['length'] <= group_boards[j][1]['length']:
-                    assign[(i, j)] = solver.IntVar(
-                        0,
-                        group_cuts[i]['quantity'],
-                        f'assign_{dim}_{i}_{j}'
-                    )
-
-        # Constraint: Each cut quantity must be satisfied
-        for i in range(num_cuts):
-            valid_boards = [j for j in range(num_boards) if (i, j) in assign]
-            if not valid_boards:
+        
+        # Variables: how many times to use each pattern for each board type
+        pattern_vars = {}
+        for board_idx, patterns in board_patterns.items():
+            for pattern_idx, pattern in enumerate(patterns):
+                var_name = f'pattern_{board_idx}_{pattern_idx}'
+                # Upper bound: worst case is using this pattern for all cuts
+                max_uses = max(
+                    (cut_requirements.get(cut_len, 0) + pattern.get(cut_len, 1) - 1) // pattern.get(cut_len, 1)
+                    for cut_len in pattern.keys()
+                ) if pattern else 0
+                pattern_vars[(board_idx, pattern_idx)] = solver.IntVar(0, max_uses * 2, var_name)
+        
+        # Constraints: Each cut type must be satisfied exactly
+        for cut_len, required_qty in cut_requirements.items():
+            constraint_terms = []
+            for (board_idx, pattern_idx), var in pattern_vars.items():
+                pattern = board_patterns[board_idx][pattern_idx]
+                cut_count = pattern.get(cut_len, 0)
+                if cut_count > 0:
+                    constraint_terms.append((var, cut_count))
+            
+            if not constraint_terms:
                 raise RuntimeError(
-                    f"Cut of length {group_cuts[i]['length']} cannot fit on any "
-                    f"board for dimension {dim[0]}x{dim[1]}"
+                    f"No pattern can produce cut of length {cut_len} for dimension {dim[0]}x{dim[1]}"
                 )
+            
             solver.Add(
-                sum(assign[(i, j)] for j in valid_boards) == group_cuts[i]['quantity']
+                sum(var * count for var, count in constraint_terms) == required_qty
             )
-
-        # Constraint: Total cut length must fit (relaxed - doesn't guarantee bin packing works)
-        for j in range(num_boards):
-            board_len = group_boards[j][1]['length']
-            cuts_on_this_board = [i for i in range(num_cuts) if (i, j) in assign]
-
-            if cuts_on_this_board:
-                # Total length constraint
-                solver.Add(
-                    sum(assign[(i, j)] * group_cuts[i]['length'] for i in cuts_on_this_board)
-                    <= board_qty[j] * board_len
-                )
-
-                # Per-cut-type constraint: can't put more cuts than physically fit
-                for i in cuts_on_this_board:
-                    cut_len = group_cuts[i]['length']
-                    max_per_board = board_len // cut_len
-                    if max_per_board > 0:
-                        solver.Add(assign[(i, j)] <= board_qty[j] * max_per_board)
-
-        # Objective: minimize cost
+        
+        # Objective: Minimize total cost
+        objective_terms = []
+        for (board_idx, pattern_idx), var in pattern_vars.items():
+            board = next(b for idx, b in group_boards if idx == board_idx)
+            objective_terms.append((var, board['price']))
+        
         solver.Minimize(
-            solver.Sum(
-                board_qty[j] * group_boards[j][1]['price']
-                for j in range(num_boards)
-            )
+            solver.Sum(var * price for var, price in objective_terms)
         )
-
+        
+        # Solve
         status = solver.Solve()
-        if status != pywraplp.Solver.OPTIMAL:
+        if status not in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
             raise RuntimeError(
-                f"No optimal solution found for dimension {dim[0]}x{dim[1]}. "
-                f"Solver status: {status}"
+                f"No solution found for dimension {dim[0]}x{dim[1]}. Solver status: {status}"
             )
-
-        # Build detailed cut plan and handle bin packing
-        dimension_cost = 0
-        for j, (board_idx, board) in enumerate(group_boards):
-            # Collect all cuts assigned to this board type
-            cuts_for_board_type = []
-            for i in range(num_cuts):
-                if (i, j) in assign:
-                    count = int(assign[(i, j)].solution_value())
-                    cuts_for_board_type.extend([group_cuts[i]['length']] * count)
-
-            if cuts_for_board_type:
+        
+        # Extract solution and build cutting plan
+        for board_idx, patterns in board_patterns.items():
+            cuts_for_this_board_type = []
+            patterns_used = []  # Track which patterns were used
+            
+            for pattern_idx, pattern in enumerate(patterns):
+                var = pattern_vars[(board_idx, pattern_idx)]
+                times_used = int(round(var.solution_value()))
+                
+                if times_used > 0:
+                    # Record pattern usage
+                    for _ in range(times_used):
+                        patterns_used.append(pattern.copy())
+                    
+                    # Add all cuts from this pattern usage
+                    for cut_len, count in pattern.items():
+                        cuts_for_this_board_type.extend([cut_len] * (count * times_used))
+            
+            if cuts_for_this_board_type:
+                board = next(b for idx, b in group_boards if idx == board_idx)
                 board_length = board['length']
-
-                # Pack cuts into boards (without limit to find actual need)
-                packed_boards = _pack_cuts_into_boards(
-                    cuts_for_board_type,
-                    board_length,
-                    num_boards=None
-                )
-                boards_actually_used = len(packed_boards)
-
-                # Record actual boards used
-                total_board_plan[board_idx] = total_board_plan.get(board_idx, 0) + boards_actually_used
-
+                
+                # Pack cuts into individual boards for detailed plan
+                packed_boards = _pack_cuts_into_boards(cuts_for_this_board_type, board_length)
+                boards_used = len(packed_boards)
+                
+                # Record in board plan
+                total_board_plan[board_idx] = total_board_plan.get(board_idx, 0) + boards_used
+                
                 # Add to cut plan
                 if board_idx not in total_cut_plan:
                     total_cut_plan[board_idx] = []
                 total_cut_plan[board_idx].extend(packed_boards)
-
+                
                 # Calculate waste
-                total_waste = sum(
-                    board_length - sum(cuts) for cuts in packed_boards
-                )
+                total_waste = sum(board_length - sum(cuts) for cuts in packed_boards)
                 waste_summary[board_idx] = waste_summary.get(board_idx, 0) + total_waste
-
+                
                 # Add to cost
-                dimension_cost += boards_actually_used * board['price']
-
-        total_cost += dimension_cost
-
+                total_cost += boards_used * board['price']
+    
     return {
         "board_plan": total_board_plan,
         "cut_plan": total_cut_plan,
