@@ -1,81 +1,58 @@
-from flask import Flask, request, jsonify
+# app/main.py
+# app/main.py
+from flask import Flask, request
 from flask_cors import CORS
-from app.optimizer.optimizer import optimize_boards
-from app.database.supabase_client import supabase
+from app.routes import optimizer_routes, auth_routes, user_routes
 
-app = Flask(__name__)
-CORS(app)
+def create_app():
+    app = Flask(__name__)
+    
+    # Configuration
+    app.config.from_object('app.config.Config')
+    
+    # CORS configuration - more permissive for debugging
+    CORS(app, 
+         origins=[
+             "http://localhost:3000",
+             "http://localhost:5173",
+             "https://lumberlogic-frontend.vercel.app"
+         ],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         allow_headers=["Content-Type", "Authorization"],
+         supports_credentials=True,
+         expose_headers=["Content-Type", "Authorization"],
+         max_age=3600
+    )
+    
+    # Register blueprints
+    app.register_blueprint(optimizer_routes.bp)
+    app.register_blueprint(auth_routes.bp)
+    app.register_blueprint(user_routes.bp)
+    
+    # Health check endpoint
+    @app.route("/health", methods=["GET"])
+    def health():
+        return {"status": "ok"}, 200
+    
+    # Add explicit OPTIONS handler for all routes
+    @app.after_request
+    def after_request(response):
+        origin = request.headers.get('Origin')
+        allowed_origins = [
+            "http://localhost:3000",
+            "http://localhost:5173", 
+            "https://lumberlogic-frontend.vercel.app"
+        ]
+        if origin in allowed_origins:
+            response.headers.add('Access-Control-Allow-Origin', origin)
+            response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+            response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+            response.headers.add('Access-Control-Allow-Credentials', 'true')
+        return response
+    
+    return app
 
-# ==========================
-# Optimize endpoint
-# ==========================
-@app.route("/optimize", methods=["POST"])
-def optimize():
-    try:
-        data = request.get_json(force=True)
-        cuts = data.get("cuts")
-        boards = data.get("boards")
-
-        if not cuts or not boards:
-            return jsonify({"error": "Both 'cuts' and 'boards' are required"}), 400
-
-        result = optimize_boards(cuts, boards)
-        return jsonify(result), 200
-
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
-
-# ==========================
-# Health check endpoint
-# ==========================
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-# ==========================
-# Users endpoints
-# ==========================
-@app.route("/users", methods=["POST"])
-def add_user():
-    data = request.get_json(force=True)
-    name = data.get("name")
-    email = data.get("email")
-    password = data.get("password")
-
-    if not name or not email or not password:
-        return jsonify({"error": "name, email, and password are required"}), 400
-
-    try:
-        response = supabase.table("users").insert({
-            "name": name,
-            "email": email,
-            "password": password
-        }).execute()
-
-        # Check if response.data exists
-        if response.data is None:
-            return jsonify({"error": "Failed to insert user"}), 400
-
-        return jsonify({"message": "User added successfully"}), 201
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/users", methods=["GET"])
-def list_users():
-    try:
-        response = supabase.table("users").select("name,email").execute()
-        # If data is None, Supabase likely failed
-        if response.data is None:
-            return jsonify({"error": "Failed to fetch users"}), 400
-
-        return jsonify(response.data), 200
-    except Exception as e:
-        # Catch unexpected errors (e.g., network issues)
-        return jsonify({"error": str(e)}), 500
+app = create_app()
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
